@@ -6,7 +6,7 @@
     <PublishSingleFile>true</PublishSingleFile>
     <SelfContained>true</SelfContained>
     <RuntimeIdentifier>win-x64</RuntimeIdentifier>
-    <AssemblyName>DisplayToggle</AssemblyName>
+    <AssemblyName>NBT</AssemblyName>
   </PropertyGroup>
   <ItemGroup>
     <PackageReference Include="NvAPIWrapper.Net" Version="0.8.1.101" />
