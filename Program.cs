@@ -61,11 +61,24 @@ static class Win32
 
     [DllImport("gdi32.dll")]
     public static extern bool GetDeviceGammaRamp(IntPtr hDC, ref GammaRamp ramp);
+
+    [DllImport("powrprof.dll")]
+    public static extern uint PowerSetActiveScheme(IntPtr RootPowerKey, ref Guid SchemeGuid);
+
+    [DllImport("powrprof.dll")]
+    public static extern uint PowerGetActiveScheme(IntPtr RootPowerKey, out IntPtr SchemeGuidPtr);
+
+    [DllImport("kernel32.dll")]
+    public static extern IntPtr LocalFree(IntPtr hMem);
 }
 
 // ─── MAIN ────────────────────────────────────────────────────────────────────
 static class Program
 {
+    static readonly Guid PlanPerformance = new("d0d2696b-417a-4cc2-8f70-abb4cffc9c89"); // Ultimate Performance
+    static readonly Guid PlanBalanced    = new("381b4222-f694-41f0-9685-ff5bb260df2e"); // Balanced
+    static readonly Guid PlanEco         = new("a1841308-3541-4fab-bc81-f71556f20b4a"); // Power Saver
+
     static StreamWriter? _log;
 
     static void Log(string msg = "")
@@ -86,14 +99,11 @@ static class Program
         _log = logWriter;
         _stateFile = Path.Combine(logDir, "state.txt");
 
-        Log($"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] === Display Profile Toggle ===");
-        PrintNvidiaInfo();
-
-        // Apply whatever was last saved on launch
         string saved = File.Exists(_stateFile) ? File.ReadAllText(_stateFile).Trim() : "1";
         var initial = saved switch { "2" => Profiles.L2, "3" => Profiles.L3, "4" => Profiles.L4, "5" => Profiles.L5, _ => Profiles.L1 };
         ApplyProfile(initial, saved);
-
+        Log($"Power    : {GetActivePlanName()}");
+        Log();
         PrintMenu();
 
         while (true)
@@ -112,85 +122,54 @@ static class Program
                 _ => null
             };
 
-            if (key == ConsoleKey.Q) { Log("Quit."); break; }
-            else if (p is not null) { ApplyProfile(p, p.Name[^1..]); PrintMenu(); }
-            else { PrintMenu(); }
+            if      (key == ConsoleKey.Q) { Log("Quit."); break; }
+            else if (key == ConsoleKey.P) { SetPowerPlan(PlanPerformance, "Ultimate Performance"); PrintMenu(); }
+            else if (key == ConsoleKey.B) { SetPowerPlan(PlanBalanced,    "Balanced");             PrintMenu(); }
+            else if (key == ConsoleKey.E) { SetPowerPlan(PlanEco,         "Eco (Power Saver)");    PrintMenu(); }
+            else if (p is not null)       { ApplyProfile(p, p.Name[^1..]); PrintMenu(); }
+            else                          { PrintMenu(); }
         }
     }
 
     static void PrintMenu()
     {
-        Console.WriteLine("  1 = Normal   2   3   4   5 = Brightest   Q = Quit");
+        Console.WriteLine("  1 = Normal   2   3   4   5 = Brightest   P = Performance   B = Balanced   E = Eco   Q = Quit");
     }
 
     static void ApplyProfile(Profile profile, string name)
     {
-        Log($"[{DateTime.Now:HH:mm:ss}] Switching to: {profile.Name}");
-        Log($"  Gamma={profile.Gamma}  Brightness={profile.Brightness:+0.00;-0.00;+0.00}  Contrast={profile.Contrast}");
-
-        var monitors = GetMonitors();
-        int applied = 0;
-        foreach (var mon in monitors)
+        foreach (var mon in GetMonitors())
         {
-            bool primary = (mon.flags & 1) != 0;
-            if (!primary) continue;
-
-            Log($"  Monitor: {mon.device}  {mon.w}x{mon.h}  [PRIMARY]");
-
+            if ((mon.flags & 1) == 0) continue;
             IntPtr dc = Win32.CreateDC(null, mon.device, null, IntPtr.Zero);
-            if (dc == IntPtr.Zero) { Log("    ERROR: CreateDC failed"); continue; }
-
-            var before = MakeRamp();
-            Win32.GetDeviceGammaRamp(dc, ref before);
-            ushort midBefore = before.Red[128];
-
+            if (dc == IntPtr.Zero) { Log("ERROR: CreateDC failed"); continue; }
             var ramp = BuildRamp(profile);
-            bool ok = Win32.SetDeviceGammaRamp(dc, ref ramp);
-
-            var after = MakeRamp();
-            Win32.GetDeviceGammaRamp(dc, ref after);
-            ushort midAfter = after.Red[128];
-
+            Win32.SetDeviceGammaRamp(dc, ref ramp);
             Win32.DeleteDC(dc);
-
-            bool changed = midAfter != midBefore;
-            Log($"    SetDeviceGammaRamp : {(ok ? "OK" : "FAILED")}");
-            Log($"    Ramp Red[128]      : before={midBefore}  after={midAfter}  -> {(changed ? "changed OK" : "UNCHANGED - driver overriding")}");
-
-            if (ok && !changed)
-            {
-                Log("    NOTE: NVCP is resetting the ramp. Try 'Use desktop color settings' in NVCP.");
-            }
-
-            if (ok) applied++;
         }
-
-        Log(applied > 0 ? $"  Applied to {applied} monitor(s)." : "  WARNING: No monitors updated.");
+        Log($"Display  : {profile.Name}");
         File.WriteAllText(_stateFile, name);
     }
 
-    static void PrintNvidiaInfo()
+    static void SetPowerPlan(Guid guid, string name)
     {
-        try
-        {
-            NvAPIWrapper.NVIDIA.Initialize();
+        uint result = Win32.PowerSetActiveScheme(IntPtr.Zero, ref guid);
+        if (result == 0)
+            Log($"Power    : {name}");
+        else
+            Log($"Power    : FAILED (0x{result:X}) — try running as admin");
+    }
 
-            Log($"Driver : {NvAPIWrapper.NVIDIA.DriverVersion} (branch {NvAPIWrapper.NVIDIA.DriverBranchVersion})");
-
-            var gpus = NvAPIWrapper.GPU.PhysicalGPU.GetPhysicalGPUs();
-            foreach (var gpu in gpus)
-                Log($"GPU    : {gpu.FullName}");
-
-            var displays = NvAPIWrapper.Display.Display.GetDisplays();
-            Log($"NVIDIA outputs ({displays.Length}):");
-            foreach (var d in displays)
-                Log($"  {d.Name}  DVC={d.DigitalVibranceControl.CurrentLevel}");
-        }
-        catch (Exception ex)
-        {
-            Log($"NvAPI  : {ex.Message}");
-        }
-        Log();
+    static string GetActivePlanName()
+    {
+        uint result = Win32.PowerGetActiveScheme(IntPtr.Zero, out IntPtr ptr);
+        if (result != 0 || ptr == IntPtr.Zero) return "unknown";
+        Guid active = Marshal.PtrToStructure<Guid>(ptr);
+        Win32.LocalFree(ptr);
+        if (active == PlanPerformance) return "Ultimate Performance";
+        if (active == PlanBalanced)    return "Balanced";
+        if (active == PlanEco)         return "Eco (Power Saver)";
+        return active.ToString();
     }
 
     static List<(string device, int x, int y, int w, int h, uint flags)> GetMonitors()
