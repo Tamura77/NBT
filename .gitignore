@@ -1,0 +1,17 @@
+# Build output
+bin/
+obj/
+
+# User-specific files
+*.user
+*.suo
+.vs/
+
+# Local app data (log + state files written at runtime)
+%LOCALAPPDATA%/DisplayToggle/
+
+# Rider / JetBrains
+.idea/
+
+# macOS
+.DS_Store
