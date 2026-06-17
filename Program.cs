@@ -1,8 +1,10 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
+using System.Threading;
 
 // ─── PRESETS ────────────────────────────────────────────────────────────────
 // Gamma:      1.0 = normal | >1.0 lifts dark areas
@@ -214,6 +216,39 @@ static class Win32
 
     [DllImport("user32.dll")]
     public static extern int DisplayConfigGetDeviceInfo(ref DISPLAYCONFIG_SOURCE_DEVICE_NAME requestPacket);
+
+    // ─── GLOBAL HOTKEY APIs ──────────────────────────────────────────────────
+    [StructLayout(LayoutKind.Sequential)]
+    public struct MSG
+    {
+        public IntPtr hwnd;
+        public uint   message;
+        public IntPtr wParam;
+        public IntPtr lParam;
+        public uint   time;
+        public int    ptX, ptY;
+    }
+
+    public const uint WM_HOTKEY    = 0x0312;
+    public const uint WM_QUIT      = 0x0012;
+    public const uint MOD_ALT      = 0x0001;
+    public const uint MOD_CONTROL  = 0x0002;
+    public const uint MOD_NOREPEAT = 0x4000;
+
+    [DllImport("user32.dll")]
+    public static extern bool RegisterHotKey(IntPtr hWnd, int id, uint fsModifiers, uint vk);
+
+    [DllImport("user32.dll")]
+    public static extern bool UnregisterHotKey(IntPtr hWnd, int id);
+
+    [DllImport("user32.dll")]
+    public static extern int GetMessage(out MSG lpMsg, IntPtr hWnd, uint wMsgFilterMin, uint wMsgFilterMax);
+
+    [DllImport("user32.dll")]
+    public static extern bool PostThreadMessage(uint idThread, uint Msg, IntPtr wParam, IntPtr lParam);
+
+    [DllImport("kernel32.dll")]
+    public static extern uint GetCurrentThreadId();
 }
 
 // ─── MAIN ────────────────────────────────────────────────────────────────────
@@ -242,6 +277,17 @@ static class Program
     static DISPLAYCONFIG_MODE_INFO[]       _savedModes    = [];
     static (int h, uint l, uint id)?[]     _disabledMonKey = new (int, uint, uint)?[2];
 
+    // ─── GLOBAL HOTKEY STATE ─────────────────────────────────────────────────
+    static readonly ConcurrentQueue<Action> _pendingActions = new();
+    static volatile uint _hotkeyThreadId;
+    static Thread? _hotkeyThread;
+
+    const int HK_L1 = 101;
+    const int HK_L2 = 102;
+    const int HK_L3 = 103;
+    const int HK_L4 = 104;
+    const int HK_L5 = 105;
+
     static void Main()
     {
         string logDir  = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "DisplayToggle");
@@ -261,34 +307,93 @@ static class Program
         Log($"Power    : {GetActivePlanName()}");
         LoadPersistedMonitorStates();
         Log();
+        StartHotkeyListener();
         PrintMenu();
+        Console.Write("> ");
 
         while (true)
         {
-            Console.Write("> ");
+            // Drain actions queued by global hotkeys
+            while (_pendingActions.TryDequeue(out var action))
+            {
+                Console.WriteLine();
+                action();
+                PrintMenu();
+                Console.Write("> ");
+            }
+
+            if (!Console.KeyAvailable) { Thread.Sleep(20); continue; }
+
             var key = Console.ReadKey(intercept: true).Key;
             Console.WriteLine();
 
+            if (key == ConsoleKey.Q) { Log("Quit."); break; }
+
             Profile? p = key switch
             {
-                ConsoleKey.D1 or ConsoleKey.NumPad1 => Profiles.L1,
-                ConsoleKey.D2 or ConsoleKey.NumPad2 => Profiles.L2,
-                ConsoleKey.D3 or ConsoleKey.NumPad3 => Profiles.L3,
-                ConsoleKey.D4 or ConsoleKey.NumPad4 => Profiles.L4,
-                ConsoleKey.D5 or ConsoleKey.NumPad5 => Profiles.L5,
+                ConsoleKey.D1 or ConsoleKey.NumPad1 or ConsoleKey.F1 => Profiles.L1,
+                ConsoleKey.D2 or ConsoleKey.NumPad2 or ConsoleKey.F2 => Profiles.L2,
+                ConsoleKey.D3 or ConsoleKey.NumPad3 or ConsoleKey.F3 => Profiles.L3,
+                ConsoleKey.D4 or ConsoleKey.NumPad4 or ConsoleKey.F4 => Profiles.L4,
+                ConsoleKey.D5 or ConsoleKey.NumPad5 or ConsoleKey.F5 => Profiles.L5,
                 _ => null
             };
 
-            if      (key == ConsoleKey.Q) { Log("Quit."); break; }
-            else if (key == ConsoleKey.P) { SetPowerPlan(PlanPerformance, "Ultimate Performance"); PrintMenu(); }
-            else if (key == ConsoleKey.B) { SetPowerPlan(PlanBalanced,    "Balanced");             PrintMenu(); }
-            else if (key == ConsoleKey.E) { SetPowerPlan(PlanEco,         "Eco (Power Saver)");    PrintMenu(); }
-            else if (key == ConsoleKey.L) { ToggleMonitor(0);                                      PrintMenu(); }
-            else if (key == ConsoleKey.R) { ToggleMonitor(1);                                      PrintMenu(); }
-            else if (key == ConsoleKey.X) { ForceRestoreAllMonitors();                             PrintMenu(); }
-            else if (p is not null)       { ApplyProfile(p, p.Name[^1..]); PrintMenu(); }
-            else                          { PrintMenu(); }
+            if      (key == ConsoleKey.P) SetPowerPlan(PlanPerformance, "Ultimate Performance");
+            else if (key == ConsoleKey.B) SetPowerPlan(PlanBalanced,    "Balanced");
+            else if (key == ConsoleKey.E) SetPowerPlan(PlanEco,         "Eco (Power Saver)");
+            else if (key == ConsoleKey.L) ToggleMonitor(0);
+            else if (key == ConsoleKey.R) ToggleMonitor(1);
+            else if (key == ConsoleKey.X) ForceRestoreAllMonitors();
+            else if (p is not null)       ApplyProfile(p, p.Name[^1..]);
+
+            PrintMenu();
+            Console.Write("> ");
         }
+
+        StopHotkeyListener();
+    }
+
+    static void StartHotkeyListener()
+    {
+        uint mods = Win32.MOD_CONTROL | Win32.MOD_ALT | Win32.MOD_NOREPEAT;
+        _hotkeyThread = new Thread(() =>
+        {
+            _hotkeyThreadId = Win32.GetCurrentThreadId();
+
+            Win32.RegisterHotKey(IntPtr.Zero, HK_L1, mods, 0x31); // Ctrl+Alt+1
+            Win32.RegisterHotKey(IntPtr.Zero, HK_L2, mods, 0x32); // Ctrl+Alt+2
+            Win32.RegisterHotKey(IntPtr.Zero, HK_L3, mods, 0x33); // Ctrl+Alt+3
+            Win32.RegisterHotKey(IntPtr.Zero, HK_L4, mods, 0x34); // Ctrl+Alt+4
+            Win32.RegisterHotKey(IntPtr.Zero, HK_L5, mods, 0x35); // Ctrl+Alt+5
+
+            while (Win32.GetMessage(out var msg, IntPtr.Zero, 0, 0) > 0)
+            {
+                if (msg.message != Win32.WM_HOTKEY) continue;
+                Action? act = (int)msg.wParam switch
+                {
+                    HK_L1 => () => ApplyProfile(Profiles.L1, "1"),
+                    HK_L2 => () => ApplyProfile(Profiles.L2, "2"),
+                    HK_L3 => () => ApplyProfile(Profiles.L3, "3"),
+                    HK_L4 => () => ApplyProfile(Profiles.L4, "4"),
+                    HK_L5 => () => ApplyProfile(Profiles.L5, "5"),
+                    _     => null
+                };
+                if (act is not null) _pendingActions.Enqueue(act);
+            }
+
+            for (int hkId = HK_L1; hkId <= HK_L5; hkId++)
+                Win32.UnregisterHotKey(IntPtr.Zero, hkId);
+        }) { IsBackground = true, Name = "HotkeyListener" };
+
+        _hotkeyThread.Start();
+    }
+
+    static void StopHotkeyListener()
+    {
+        uint tid = _hotkeyThreadId;
+        if (tid != 0)
+            Win32.PostThreadMessage(tid, Win32.WM_QUIT, IntPtr.Zero, IntPtr.Zero);
     }
 
     static string WinErr(int code) =>
@@ -298,7 +403,8 @@ static class Program
     {
         string lLabel = _monDisabled[0] ? "L = Left  [OFF]" : "L = Left  [on]";
         string rLabel = _monDisabled[1] ? "R = Right [OFF]" : "R = Right [on]";
-        Console.WriteLine($"  1–5 = Brightness   P/B/E = Power Plan   {lLabel}   {rLabel}   X = Restore all   Q = Quit");
+        Console.WriteLine($"  Fn+1–5 = Brightness   P/B/E = Power Plan   {lLabel}   {rLabel}   X = Restore all   Q = Quit");
+        Console.WriteLine($"  Global brightness: Ctrl+Alt+1–5");
     }
 
     // slot 0 = leftmost non-primary (most-negative x), slot 1 = rightmost non-primary (most-positive x)
